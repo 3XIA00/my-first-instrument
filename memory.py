@@ -1,0 +1,121 @@
+"""The memory store — Postgres on Neon, one fact per row.
+
+Why a database and not a JSON file: Render's free tier has an ephemeral
+filesystem, so a file resets on every redeploy. The deeper reason is that a
+file would give us TWO memories — one on the laptop where the CLI Claude talks
+to it, one on Render where claude.ai does — and neither would know what the
+other learned. One database collapses them into one memory.
+
+Design rationale for every choice here lives in docs/DESIGN-memory.md.
+"""
+import os
+import re
+from contextlib import contextmanager
+from datetime import timedelta
+
+import psycopg
+from dotenv import load_dotenv
+from psycopg.rows import dict_row
+
+load_dotenv()
+
+# Scopes are named by REASON, not duration. The model can answer "is this about
+# the user, about this project, or about today's task?" far more reliably than
+# "does this expire in 30 or 90 days?" (DESIGN-memory.md, "Scope and expiry")
+SCOPES = {
+    "task": timedelta(days=7),
+    "term": timedelta(days=180),
+    "stable": None,
+}
+SOURCES = ("user_stated", "user_confirmed", "inferred")
+
+MAX_FACT_CHARS = 200
+DUPLICATE_THRESHOLD = 0.8
+
+# Task state wearing a disguise. The docstring is a request; this is the rule.
+BANNED = re.compile(
+    r"\b(currently|right now|at the moment|today we|we'?re working on|"
+    r"just now|so far|this session)\b",
+    re.I,
+)
+
+
+@contextmanager
+def db():
+    """One connection per call — deliberately.
+
+    Neon scales to zero after 5 minutes idle, which drops pooled connections.
+    A long-lived pool would need reconnect logic for a server that might see
+    three calls an hour. Per-call costs ~50ms and cannot go stale.
+    """
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Locally: put it in .env. "
+            "On Render: Environment -> Add environment variable."
+        )
+    with psycopg.connect(url, row_factory=dict_row) as conn:
+        yield conn
+
+
+def _tokens(text: str) -> set:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def search_terms(query: str) -> list:
+    """Query -> bare alphanumeric words, safe to hand to to_tsquery().
+
+    The regex is also the sanitiser: anything that could be tsquery syntax
+    (&, |, !, parentheses, quotes) simply isn't matched, so a user's stray
+    punctuation can never become an operator or a syntax error.
+    """
+    return re.findall(r"[a-z0-9]+", query.lower())
+
+
+def _similarity(a: str, b: str) -> float:
+    """Jaccard overlap. Crude, but it catches the failure we actually see:
+    the same fact re-saved in a slightly different sentence each session."""
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def validate(fact: str, scope: str, source: str) -> str | None:
+    """Mechanical gates. Returns a refusal message, or None if the write is OK.
+
+    These are the rules we enforce rather than request. Prose in a docstring
+    gets ~70% compliance; code gets 100%.
+    """
+    if scope not in SCOPES:
+        return f"scope must be one of {', '.join(SCOPES)} — got {scope!r}."
+    if source not in SOURCES:
+        return f"source must be one of {', '.join(SOURCES)} — got {source!r}."
+    fact = fact.strip()
+    if len(fact) < 10:
+        return "Too short to be a self-contained fact."
+    if len(fact) > MAX_FACT_CHARS:
+        return (
+            f"Too long ({len(fact)} chars, limit {MAX_FACT_CHARS}). Facts are ONE "
+            "self-contained sentence. Split this into separate facts — they "
+            "expire on different schedules and are recalled by different queries."
+        )
+    hit = BANNED.search(fact)
+    if hit:
+        return (
+            f"Contains {hit.group(0)!r}, which marks this as task state rather "
+            "than a durable fact. If it's only true right now, the context "
+            "window already has it."
+        )
+    return None
+
+
+def find_duplicate(conn, fact: str):
+    rows = conn.execute(
+        "SELECT id, text FROM facts WHERE expires_at IS NULL OR expires_at > now()"
+    ).fetchall()
+    for row in rows:
+        score = _similarity(fact, row["text"])
+        if score >= DUPLICATE_THRESHOLD:
+            return row, score
+    return None, 0.0

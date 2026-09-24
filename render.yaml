@@ -6,5 +6,12 @@ services:
     name: your-first-instrument
     runtime: python
     plan: free
-    buildCommand: pip install "mcp[cli]<2"
+    region: oregon          # same region as the Neon project — see ADR-0005
+    buildCommand: pip install "mcp[cli]<2" "psycopg[binary]>=3.2" "python-dotenv>=1.0"
     startCommand: python server.py
+    envVars:
+      # Declared, never stored. sync:false means Render prompts for the value
+      # in its dashboard and it NEVER enters this repo. Same connection string
+      # as your local .env — one database, both surfaces, one memory.
+      - key: DATABASE_URL
+        sync: false
