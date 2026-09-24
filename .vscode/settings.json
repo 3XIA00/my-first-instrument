@@ -12,7 +12,7 @@
   "terminal.integrated.showLinkHover": false,
 
   // one assistant, deliberately — the ambient chorus off
-  "chat.disableAIFeatures": true,
+  "chat.disableAIFeatures": false,
   "chat.agent.enabled": false,
   "workbench.commandPalette.showAskInChat": false,
   "workbench.browser.enableChatTools": false,
@@ -26,9 +26,5 @@
   "editor.autoClosingBrackets": "never",
   "editor.inlineSuggest.enabled": true,
   "python.analysis.typeCheckingMode": "strict",
-  "adrManager.reportButton.enabled": true,
-
-  // this project's color (Peacock)
-  "peacock.color": "#A8C930",
-  "peacock.affectStatusAndTitleBorders": true
+  "adrManager.reportButton.enabled": true
 }
