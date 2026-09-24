@@ -48,7 +48,12 @@ def db():
     A long-lived pool would need reconnect logic for a server that might see
     three calls an hour. Per-call costs ~50ms and cannot go stale.
     """
-    url = os.environ.get("DATABASE_URL")
+    # .strip() is not defensive padding — pasting a connection string into a
+    # dashboard field routinely carries a trailing newline from the copy, and
+    # libpq reads it as part of the LAST parameter: channel_binding becomes
+    # "require\n" and every connection fails with a message that points at the
+    # value rather than the whitespace.
+    url = (os.environ.get("DATABASE_URL") or "").strip()
     if not url:
         raise RuntimeError(
             "DATABASE_URL is not set. Locally: put it in .env. "

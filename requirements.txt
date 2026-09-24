@@ -1,0 +1,6 @@
+# Render's Python runtime installs this automatically, with or without the
+# buildCommand in render.yaml. pyproject.toml stays the source of truth for
+# local `uv run`; keep the two in sync when you add a dependency.
+mcp[cli]>=1.2,<2
+psycopg[binary]>=3.2
+python-dotenv>=1.0
