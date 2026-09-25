@@ -29,6 +29,15 @@ SCOPES = {
 }
 SOURCES = ("user_stated", "user_confirmed", "inferred")
 
+# The tag vocabulary is seeded, not fixed. These mirror the SAVE categories in
+# remember()'s docstring one-for-one, so deciding a fact is worth saving also
+# decides its tag — one judgment instead of two. The model may add a tag, but
+# only by confirming it, which costs a round trip. Reuse is free; coining is
+# not, and that asymmetry is what keeps the vocabulary small.
+SEED_TAGS = ("identity", "preferences", "corrections", "decisions",
+             "commitments")
+MAX_TAGS = 3
+
 MAX_FACT_CHARS = 200
 DUPLICATE_THRESHOLD = 0.8
 
@@ -113,6 +122,65 @@ def validate(fact: str, scope: str, source: str) -> str | None:
             "window already has it."
         )
     return None
+
+
+def vocabulary(conn) -> dict:
+    """Every tag currently carried by an unexpired fact, with its count.
+
+    Derived from the facts themselves rather than a registry, so a tag stops
+    existing once the last fact using it expires. The vocabulary decays like
+    everything else here.
+    """
+    rows = conn.execute(
+        """SELECT unnest(tags) AS t, count(*) AS n FROM facts
+           WHERE expires_at IS NULL OR expires_at > now()
+           GROUP BY 1"""
+    ).fetchall()
+    return {r["t"]: r["n"] for r in rows}
+
+
+def render_vocabulary(counts: dict) -> str:
+    """Newline-delimited, no column padding — alignment spaces cost tokens and
+    carry no information. The standard/added split is the part that does: it
+    tells the reader which tags are the taxonomy and which were exceptions."""
+    lines = ["Standard tags:"]
+    lines += [f"{t} {counts.get(t, 0)}" for t in SEED_TAGS]
+    added = sorted((t for t in counts if t not in SEED_TAGS),
+                   key=lambda t: (-counts[t], t))
+    if added:
+        lines += ["", "Added previously:"]
+        lines += [f"{t} {counts[t]}" for t in added]
+    return "\n".join(lines)
+
+
+def check_tags(conn, tags: list, new_tags: list):
+    """Normalise tags and gate unfamiliar ones. Returns (tags, refusal|None).
+
+    Deliberately pay-on-failure: making the model call list_tags() before
+    every save would cost a round trip even when it was going to choose
+    correctly. This costs one only when there is actually a problem.
+    """
+    tags = [t.strip().lower() for t in tags if t and t.strip()]
+    if not tags:
+        return tags, ("no tags given. Choose 1-%d and call again.\n\n%s"
+                      % (MAX_TAGS, render_vocabulary(vocabulary(conn))))
+    if len(tags) > MAX_TAGS:
+        return tags, f"{len(tags)} tags given; {MAX_TAGS} is the limit."
+
+    confirmed = {t.strip().lower() for t in (new_tags or [])}
+    counts = vocabulary(conn)
+    known = set(SEED_TAGS) | set(counts)
+    unknown = [t for t in tags if t not in known and t not in confirmed]
+    if unknown:
+        which = ", ".join(repr(t) for t in unknown)
+        return tags, (
+            f"{which} not in the vocabulary yet.\n\n"
+            f"{render_vocabulary(counts)}\n\n"
+            f"Pick from those and call again — a near-synonym of an existing "
+            f"tag is what makes a store unsearchable. If this genuinely needs "
+            f"a new tag, call again with new_tags={unknown} to confirm it."
+        )
+    return tags, None
 
 
 def find_duplicate(conn, fact: str):

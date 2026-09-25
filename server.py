@@ -66,6 +66,7 @@ def remember(
     scope: str,
     source: str,
     justification: str,
+    new_tags: list[str] = [],
 ) -> str:
     """Save ONE fact so it survives past this conversation.
 
@@ -82,9 +83,12 @@ def remember(
          is worse than no fact, because it misleads while looking like
          knowledge.
 
-    SAVE: identity and context (program, machine, timezone, tooling) ·
-      stated preferences · corrections the user made to you · decisions AND
-      their rationale · dated commitments.
+    SAVE — each category is also its tag, so one judgment does both jobs:
+      identity     who they are, their context, their setup
+      preferences  how they want things done
+      corrections  where they told you that you were wrong
+      decisions    a choice that was made, and why
+      commitments  something dated they owe or expect
     DON'T SAVE: anything in a file · anything you produced yourself · task
       state ("we're on step 3") · transient system state ("tests pass") ·
       anything you INFERRED that the user didn't confirm.
@@ -94,8 +98,16 @@ def remember(
         someone who never saw this conversation understands it — resolve
         pronouns ("he said" -> who?), relative dates ("next Friday" ->
         "2026-09-25"), and deixis ("this repo" -> the actual path).
-      tags: 1-3 lowercase topic words for later filtering, e.g.
-        ["courses", "penn"].
+      tags: 1-3 tags from the SAVE list above — identity, preferences,
+        corrections, decisions, commitments. You already chose one of those
+        categories when you decided this was worth saving; use it.
+        Prefer a tag that exists over a new word that fits slightly better:
+        a vocabulary of near-synonyms is what makes a store unsearchable.
+        A tag outside the vocabulary is not saved — the tool replies with
+        everything currently in use so you can pick from it and call again.
+      new_tags: leave empty almost always. Only after the tool has refused
+        an unfamiliar tag, and only if nothing in the list it showed you
+        actually fits, repeat that tag here to confirm creating it.
       scope: how long this stays true.
         "task"   - true for the piece of work we're doing (7 days)
         "term"   - true for this semester or project (6 months)
@@ -112,6 +124,13 @@ def remember(
         return f"Not saved — {refusal}"
 
     with db() as conn:
+        # "Not saved YET" — a refusal the model can act on reads as a step in
+        # a process; "Not saved" reads as a dead end, and a tool that is
+        # already told to prefer silence will take the excuse.
+        tags, tag_refusal = memory.check_tags(conn, tags, new_tags)
+        if tag_refusal:
+            return f"Not saved yet — {tag_refusal}"
+
         dup, score = memory.find_duplicate(conn, fact)
         if dup:
             return (
@@ -234,16 +253,11 @@ def recall(query: str, tag: str = "", limit: int = 5) -> str:
 @mcp.tool()
 def list_tags() -> str:
     """Every tag in the store with its count — the map of what is known.
-    Read this before a broad recall() so you can filter instead of guess."""
+    Read this before a broad recall() so you can filter instead of guess, and
+    before remember() if you are unsure which tag a fact belongs under."""
     with db() as conn:
-        rows = conn.execute(
-            """SELECT unnest(tags) AS t, count(*) AS n FROM facts
-               WHERE expires_at IS NULL OR expires_at > now()
-               GROUP BY 1 ORDER BY n DESC"""
-        ).fetchall()
-    if not rows:
-        return "No facts saved yet."
-    return "\n".join(f"{r['t']}: {r['n']}" for r in rows)
+        counts = memory.vocabulary(conn)
+    return memory.render_vocabulary(counts)
 
 
 @mcp.tool()
@@ -336,17 +350,26 @@ def memory_stats() -> str:
             f"""SELECT source AS k, count(*) AS n FROM facts
                 WHERE {active_only} GROUP BY 1 ORDER BY n DESC"""
         ).fetchall()
+        counts = memory.vocabulary(conn)
 
     if s["total"] == 0:
         return "No facts saved yet."
     pct = f" ({s['never'] / s['active']:.0%})" if s["active"] else ""
     scopes = ", ".join(f"{r['k']} {r['n']}" for r in by_scope) or "—"
     sources = ", ".join(f"{r['k']} {r['n']}" for r in by_source) or "—"
+    # Tag hygiene as a number, not a hope. Added tags that stay at 1 are the
+    # near-synonyms the confirm gate was meant to stop; if this climbs, the
+    # seed vocabulary is wrong rather than the model being careless.
+    added = [t for t in counts if t not in memory.SEED_TAGS]
+    singles = [t for t in counts if counts[t] == 1]
+    hygiene = (f"tags: {len(memory.SEED_TAGS)} standard, {len(added)} added"
+               + (f" · {len(singles)} used only once" if singles else ""))
     return (
         f"{s['active']} active · {s['expired']} expired · {s['total']} ever\n"
         f"never recalled: {s['never']} of the active facts{pct}\n"
         f"by scope:  {scopes}\n"
-        f"by source: {sources}"
+        f"by source: {sources}\n"
+        f"{hygiene}"
     )
 
 

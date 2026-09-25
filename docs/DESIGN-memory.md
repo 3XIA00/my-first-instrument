@@ -322,8 +322,101 @@ repeat at 90% overlap, recall-refresh increments `recall_count` and pushes
 expiry forward, and `forget()` -> `expired_facts()` -> `promote()` round-trips.
 Test rows deleted afterwards; `facts` is empty and ready for real use.
 
+## Tags: a seeded vocabulary with a confirm gate
+
+### What went wrong first
+
+The original `tags` parameter was documented as *"1-3 lowercase topic words
+for later filtering, e.g. `["courses", "penn"]`"*. With one fact in the store,
+the model had already produced this:
+
+```
+#12  ['education', 'penn']
+#13  ['python', 'tooling', 'preferences']
+#14  ['preferences', 'code-style']
+
+identity 0          <- the tag that fits #12 was never used
+5 seed tags, 5 added, every added tag a singleton
+```
+
+It took `penn` **verbatim from the example** and paraphrased `courses` into
+`education`. **In a tool docstring an example is not an illustration, it is a
+default** — whatever sits after `e.g.` is what the model reaches for.
+
+### The controlled experiment sitting in the same call
+
+Fact #12 was written by one tool call with three parameters:
+
+| param | documented as | result |
+|-------|---------------|--------|
+| `scope` | closed list, enforced in code | correct (`stable`) |
+| `source` | closed list, enforced in code | correct (`user_stated`) |
+| `tags` | "topic words", free-form, one example | drifted |
+
+Same tool, same invocation. The two parameters with a closed list came back
+right; the one with an open list drifted immediately. n=1, so don't overclaim
+it — but the prediction was made before the evidence arrived.
+
+### The design
+
+Seed vocabulary mirrors the SAVE categories in the docstring **one for one**,
+so deciding a fact is worth saving also decides its tag. One judgment, not two:
+
+```
+identity     who they are, their context, their setup
+preferences  how they want things done
+corrections  where they told you that you were wrong
+decisions    a choice that was made, and why
+commitments  something dated they owe or expect
+```
+
+**Seeded, not fixed.** An unfamiliar tag is refused, and the refusal carries
+the whole live vocabulary so the model can choose from it. If nothing fits, it
+repeats the tag in `new_tags` to confirm. Reuse is free; coining costs a round
+trip, and that asymmetry is the entire mechanism.
+
+**Pay-on-failure.** The obvious alternative — require `list_tags()` before
+every save — costs a round trip even when the model was going to choose
+correctly. Refusing on the unknown case costs one only when there is a problem.
+Expected price: ~300 tokens and one model turn, a handful of times early on,
+decaying toward zero as the seeds cover the common cases.
+
+**"Not saved yet", not "Not saved".** The real risk is not cost, it is
+abandonment: a model already told to prefer silence will take a refusal as an
+excuse to stop. The refusal is worded as a step in a process, with an
+imperative, not as an error.
+
+**No registry table.** The vocabulary is `SEED_TAGS` union the tags on
+unexpired facts, so a tag stops existing when the last fact carrying it
+expires. It decays like everything else here.
+
+### Tag what the text can't tell you
+
+A tension that only appeared once real facts existed: the seed vocabulary is
+*category*-shaped (`identity`, `decisions`), but the model also produced
+*topic*-shaped tags (`penn`, `python`). Two kinds of label in one namespace —
+the same two-taxonomies problem that killed the `category` column, arriving
+through a different door.
+
+**The rule: tag what the text can't tell you; let search handle what it can.**
+"Penn" and "Python" are already in the fact text and `recall` searches text, so
+those tags are redundant. "This is an identity fact" appears nowhere in the
+text and can never be inferred from it. Categories earn a tag; topics don't.
+That is also *why* the seed list has the shape it does.
+
+### Rendering
+
+Newline-delimited, single space, no column alignment — padding costs tokens and
+carries no information. The standard/added split is the part that does: it says
+which tags are the taxonomy and which were exceptions someone had to justify.
+
+Do not truncate the list when it grows. The model is being asked to choose, and
+a hidden option cannot be chosen. If the list is too long to show, the answer is
+fewer tags, not less display — and `memory_stats` reports singleton count so
+that failure is visible rather than hoped against.
+
 ## OPEN — still to build
 
-- ADR-0005 on choosing a database over a file: DONE
-- Deploy: push to GitHub, set `DATABASE_URL` in Render, swap the connector URL
-- `pgvector` for semantic recall — the demonstrated gap above
+- No-dead-end recall: a keyword miss should return recent facts, not nothing
+- Source label on recall results, so blending with a competing memory is visible
+- `pgvector` for semantic recall — the demonstrated gap
