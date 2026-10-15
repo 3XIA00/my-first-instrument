@@ -124,17 +124,24 @@ def validate(fact: str, scope: str, source: str) -> str | None:
     return None
 
 
-def vocabulary(conn) -> dict:
-    """Every tag currently carried by an unexpired fact, with its count.
+def vocabulary(conn, user_id) -> dict:
+    """Every tag on THIS SHELF carried by an unexpired fact, with its count.
 
     Derived from the facts themselves rather than a registry, so a tag stops
     existing once the last fact using it expires. The vocabulary decays like
-    everything else here.
+    everything else here — and it is per-shelf, so the menu a guest is shown
+    is the commons' vocabulary, never yours.
+
+    The parentheses around the expiry test are load-bearing: AND binds tighter
+    than OR, so without them this would read "unexpired, OR expiring later and
+    owned by you" and hand every caller the whole table.
     """
     rows = conn.execute(
         """SELECT unnest(tags) AS t, count(*) AS n FROM facts
-           WHERE expires_at IS NULL OR expires_at > now()
-           GROUP BY 1"""
+           WHERE (expires_at IS NULL OR expires_at > now())
+             AND user_id IS NOT DISTINCT FROM %s
+           GROUP BY 1""",
+        (user_id,),
     ).fetchall()
     return {r["t"]: r["n"] for r in rows}
 
@@ -153,7 +160,7 @@ def render_vocabulary(counts: dict) -> str:
     return "\n".join(lines)
 
 
-def check_tags(conn, tags: list, new_tags: list):
+def check_tags(conn, tags: list, new_tags: list, user_id):
     """Normalise tags and gate unfamiliar ones. Returns (tags, refusal|None).
 
     Deliberately pay-on-failure: making the model call list_tags() before
@@ -163,12 +170,12 @@ def check_tags(conn, tags: list, new_tags: list):
     tags = [t.strip().lower() for t in tags if t and t.strip()]
     if not tags:
         return tags, ("no tags given. Choose 1-%d and call again.\n\n%s"
-                      % (MAX_TAGS, render_vocabulary(vocabulary(conn))))
+                      % (MAX_TAGS, render_vocabulary(vocabulary(conn, user_id))))
     if len(tags) > MAX_TAGS:
         return tags, f"{len(tags)} tags given; {MAX_TAGS} is the limit."
 
     confirmed = {t.strip().lower() for t in (new_tags or [])}
-    counts = vocabulary(conn)
+    counts = vocabulary(conn, user_id)
     known = set(SEED_TAGS) | set(counts)
     unknown = [t for t in tags if t not in known and t not in confirmed]
     if unknown:
@@ -183,9 +190,18 @@ def check_tags(conn, tags: list, new_tags: list):
     return tags, None
 
 
-def find_duplicate(conn, fact: str):
+def find_duplicate(conn, fact: str, user_id):
+    """Scan THIS SHELF only.
+
+    Unscoped, the refusal this feeds would quote a stranger's fact back
+    verbatim — a disclosure through an error string, which is exactly the kind
+    that survives a test of the happy path.
+    """
     rows = conn.execute(
-        "SELECT id, text FROM facts WHERE expires_at IS NULL OR expires_at > now()"
+        """SELECT id, text FROM facts
+           WHERE (expires_at IS NULL OR expires_at > now())
+             AND user_id IS NOT DISTINCT FROM %s""",
+        (user_id,),
     ).fetchall()
     for row in rows:
         score = _similarity(fact, row["text"])

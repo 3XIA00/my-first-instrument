@@ -1086,6 +1086,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
     { name = "psycopg", extra = ["binary"] },
+    { name = "pyjwt", extra = ["crypto"] },
     { name = "python-dotenv" },
 ]
 
@@ -1093,5 +1094,6 @@ dependencies = [
 requires-dist = [
     { name = "mcp", extras = ["cli"], specifier = ">=1.2,<2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
     { name = "python-dotenv", specifier = ">=1.0" },
 ]

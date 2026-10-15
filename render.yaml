@@ -7,7 +7,7 @@ services:
     runtime: python
     plan: free
     region: oregon          # same region as the Neon project — see ADR-0005
-    buildCommand: pip install "mcp[cli]<2" "psycopg[binary]>=3.2" "python-dotenv>=1.0"
+    buildCommand: pip install "mcp[cli]<2" "psycopg[binary]>=3.2" "python-dotenv>=1.0" "pyjwt[crypto]>=2.9"
     startCommand: python server.py
     envVars:
       # Declared, never stored. sync:false means Render prompts for the value
@@ -15,3 +15,18 @@ services:
       # as your local .env — one database, both surfaces, one memory.
       - key: DATABASE_URL
         sync: false
+      # Neon console -> your project -> Settings -> Better Auth -> JWKS URL.
+      # Public by design (it serves verification keys), but it is still
+      # deployment configuration, so it lives here and not in the code.
+      - key: NEON_AUTH_JWKS_URL
+        sync: false
+      # Optional (ADR-0006): the expected `iss` claim. Left unset, issuer is
+      # not checked -- the JWKS URL is already project-scoped, so a foreign
+      # token fails at the signature.
+      - key: NEON_AUTH_ISSUER
+        sync: false
+      # PUBLIC_URL is NOT declared here on purpose: Render sets
+      # RENDER_EXTERNAL_URL itself and auth.py reads that, so the OAuth
+      # discovery documents are correct on this host with no configuration.
+      # Set PUBLIC_URL by hand only when the server is reached through some
+      # other name -- a cloudflared tunnel, or a custom domain.

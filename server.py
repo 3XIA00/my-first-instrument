@@ -7,13 +7,18 @@ server is the smallest honest fix — and the pattern generalizes.
 The memory tools fix the next blindness along: a model has no sense of
 *before*. Everything it learns about you dies when the conversation ends.
 Every choice made there is argued in docs/DESIGN-memory.md.
+
+As of ADR-0006 the server also knows WHO is asking. A signed-in caller gets a
+private shelf; a signed-out one shares the guest commons; an invalid token is
+a loud error rather than a quiet demotion to guest.
 """
 import os
 from datetime import datetime, timezone
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 import memory
+from identity import current_identity, shelf
 from memory import SCOPES, db
 
 mcp = FastMCP(
@@ -66,6 +71,7 @@ def remember(
     scope: str,
     source: str,
     justification: str,
+    ctx: Context,
     new_tags: list[str] = [],
 ) -> str:
     """Save ONE fact so it survives past this conversation.
@@ -123,15 +129,16 @@ def remember(
     if refusal:
         return f"Not saved — {refusal}"
 
+    user_id, _ = current_identity(ctx)
     with db() as conn:
         # "Not saved YET" — a refusal the model can act on reads as a step in
         # a process; "Not saved" reads as a dead end, and a tool that is
         # already told to prefer silence will take the excuse.
-        tags, tag_refusal = memory.check_tags(conn, tags, new_tags)
+        tags, tag_refusal = memory.check_tags(conn, tags, new_tags, user_id)
         if tag_refusal:
             return f"Not saved yet — {tag_refusal}"
 
-        dup, score = memory.find_duplicate(conn, fact)
+        dup, score = memory.find_duplicate(conn, fact, user_id)
         if dup:
             return (
                 f"Not saved — {score:.0%} overlap with #{dup['id']} "
@@ -141,28 +148,33 @@ def remember(
             )
         row = conn.execute(
             """INSERT INTO facts
-                   (text, tags, scope, source, justification, expires_at)
-               VALUES (%s, %s, %s, %s, %s, %s)
+                   (text, tags, scope, source, justification, expires_at,
+                    user_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
                RETURNING id""",
-            (fact, tags, scope, source, justification, _expiry(scope)),
+            (fact, tags, scope, source, justification, _expiry(scope),
+             user_id),
         ).fetchone()
         stats = conn.execute(
             """SELECT count(*) AS total,
                       count(*) FILTER (WHERE recall_count = 0) AS never
-               FROM facts WHERE expires_at IS NULL OR expires_at > now()"""
+               FROM facts
+               WHERE (expires_at IS NULL OR expires_at > now())
+                 AND user_id IS NOT DISTINCT FROM %s""",
+            (user_id,),
         ).fetchone()
 
     ttl = SCOPES[scope]
     when = "never expires" if ttl is None else f"expires in {ttl.days} days"
     return (
-        f"Saved as #{row['id']} ({scope}, {when}). "
-        f"Store now holds {stats['total']} active facts; "
+        f"Saved as #{row['id']} to {shelf(user_id)} ({scope}, {when}). "
+        f"That shelf now holds {stats['total']} active facts; "
         f"{stats['never']} have never been recalled."
     )
 
 
 @mcp.tool()
-def recall(query: str, tag: str = "", limit: int = 5) -> str:
+def recall(query: str, ctx: Context, tag: str = "", limit: int = 5) -> str:
     """Search saved facts. Call this when a question touches the user's own
     life, preferences, projects or history — anything you would otherwise
     have to guess at, or ask them to repeat.
@@ -180,9 +192,11 @@ def recall(query: str, tag: str = "", limit: int = 5) -> str:
     # "penn course" finds nothing even when a fact says "Penn" and is tagged
     # "courses". Silent misses are the failure this tool exists to avoid;
     # ts_rank still floats the facts matching more words to the top.
+    user_id, _ = current_identity(ctx)
     terms = memory.search_terms(query)
-    where = ["(expires_at IS NULL OR expires_at > now())"]
-    params: list = []
+    where = ["(expires_at IS NULL OR expires_at > now())",
+             "user_id IS NOT DISTINCT FROM %s"]
+    params: list = [user_id]
     if tag:
         where.append("%s = ANY(tags)")
         params.append(tag)
@@ -200,8 +214,8 @@ def recall(query: str, tag: str = "", limit: int = 5) -> str:
         ).fetchone()["n"]
         if total == 0:
             scoped = f" with tag {tag!r}" if tag else ""
-            return (f"No facts match {query!r}{scoped}. "
-                    "Try list_tags() to see what is actually in the store.")
+            return (f"No facts on {shelf(user_id)} match {query!r}{scoped}. "
+                    "Try list_tags() to see what is actually on it.")
 
         breakdown = conn.execute(
             f"""SELECT unnest(tags) AS t, count(*) AS n FROM facts
@@ -226,8 +240,8 @@ def recall(query: str, tag: str = "", limit: int = 5) -> str:
         conn.execute(
             f"""UPDATE facts SET last_recalled = now(),
                     recall_count = recall_count + 1, {_REFRESH}
-                WHERE id = ANY(%s)""",
-            ([r["id"] for r in rows],),
+                WHERE id = ANY(%s) AND user_id IS NOT DISTINCT FROM %s""",
+            ([r["id"] for r in rows], user_id),
         )
 
     header = f"{total} fact{'' if total == 1 else 's'} match"
@@ -251,17 +265,18 @@ def recall(query: str, tag: str = "", limit: int = 5) -> str:
 
 
 @mcp.tool()
-def list_tags() -> str:
+def list_tags(ctx: Context) -> str:
     """Every tag in the store with its count — the map of what is known.
     Read this before a broad recall() so you can filter instead of guess, and
     before remember() if you are unsure which tag a fact belongs under."""
+    user_id, _ = current_identity(ctx)
     with db() as conn:
-        counts = memory.vocabulary(conn)
+        counts = memory.vocabulary(conn, user_id)
     return memory.render_vocabulary(counts)
 
 
 @mcp.tool()
-def promote(fact_id: int, scope: str) -> str:
+def promote(fact_id: int, scope: str, ctx: Context) -> str:
     """Extend a fact's life — it turned out to matter more than first thought.
     Also the way to rescue something listed by expired_facts().
 
@@ -271,21 +286,23 @@ def promote(fact_id: int, scope: str) -> str:
     """
     if scope not in SCOPES:
         return f"scope must be one of {', '.join(SCOPES)} — got {scope!r}."
+    user_id, _ = current_identity(ctx)
     with db() as conn:
         row = conn.execute(
             """UPDATE facts SET scope = %s, expires_at = %s
-               WHERE id = %s RETURNING text""",
-            (scope, _expiry(scope), fact_id),
+               WHERE id = %s AND user_id IS NOT DISTINCT FROM %s
+               RETURNING text""",
+            (scope, _expiry(scope), fact_id, user_id),
         ).fetchone()
     if not row:
-        return f"No fact #{fact_id}."
+        return f"No fact #{fact_id} on {shelf(user_id)}."
     ttl = SCOPES[scope]
     when = "never expires" if ttl is None else f"expires in {ttl.days} days"
     return f"#{fact_id} is now {scope} ({when}): {row['text']!r}"
 
 
 @mcp.tool()
-def forget(fact_id: int) -> str:
+def forget(fact_id: int, ctx: Context) -> str:
     """Retire a fact — wrong, outdated, or one that never should have been
     saved. Takes an id rather than a search, so nothing goes in bulk.
 
@@ -293,29 +310,34 @@ def forget(fact_id: int) -> str:
     listed by expired_facts(), recoverable with promote(). Deletion is
     irreversible; exclusion isn't.
     """
+    user_id, _ = current_identity(ctx)
     with db() as conn:
         row = conn.execute(
-            "UPDATE facts SET expires_at = now() WHERE id = %s RETURNING text",
-            (fact_id,),
+            """UPDATE facts SET expires_at = now()
+               WHERE id = %s AND user_id IS NOT DISTINCT FROM %s
+               RETURNING text""",
+            (fact_id, user_id),
         ).fetchone()
     if not row:
-        return f"No fact #{fact_id}."
+        return f"No fact #{fact_id} on {shelf(user_id)}."
     return f"Retired #{fact_id}: {row['text']!r} — recover it with promote()."
 
 
 @mcp.tool()
-def expired_facts(limit: int = 20) -> str:
+def expired_facts(ctx: Context, limit: int = 20) -> str:
     """What the store has forgotten, and when. Nothing here is gone — any of
     it can be brought back with promote()."""
+    user_id, _ = current_identity(ctx)
     with db() as conn:
         rows = conn.execute(
             """SELECT id, text, scope, expires_at, recall_count FROM facts
                WHERE expires_at IS NOT NULL AND expires_at <= now()
+                 AND user_id IS NOT DISTINCT FROM %s
                ORDER BY expires_at DESC LIMIT %s""",
-            (limit,),
+            (user_id, limit),
         ).fetchall()
     if not rows:
-        return "Nothing has expired yet."
+        return f"Nothing on {shelf(user_id)} has expired yet."
     lines = []
     for r in rows:
         stamp = r["expires_at"].strftime("%Y-%m-%d")
@@ -327,11 +349,15 @@ def expired_facts(limit: int = 20) -> str:
 
 
 @mcp.tool()
-def memory_stats() -> str:
+def memory_stats(ctx: Context) -> str:
     """How this memory is actually being used — including how much was saved
     and then never recalled once. Whether the instrument is being used
     greedily is an empirical question; this is how you answer it."""
     active_only = "expires_at IS NULL OR expires_at > now()"
+    # Parenthesised wherever it is AND-ed: without them AND binds tighter than
+    # the inner OR, and the ownership filter silently stops filtering.
+    mine = "user_id IS NOT DISTINCT FROM %s"
+    user_id, _ = current_identity(ctx)
     with db() as conn:
         s = conn.execute(
             f"""SELECT count(*) FILTER (WHERE {active_only}) AS active,
@@ -340,20 +366,23 @@ def memory_stats() -> str:
                        count(*) FILTER (WHERE recall_count = 0
                            AND ({active_only})) AS never,
                        count(*) AS total
-                FROM facts"""
+                FROM facts WHERE {mine}""",
+            (user_id,),
         ).fetchone()
         by_scope = conn.execute(
             f"""SELECT scope AS k, count(*) AS n FROM facts
-                WHERE {active_only} GROUP BY 1 ORDER BY n DESC"""
+                WHERE ({active_only}) AND {mine} GROUP BY 1 ORDER BY n DESC""",
+            (user_id,),
         ).fetchall()
         by_source = conn.execute(
             f"""SELECT source AS k, count(*) AS n FROM facts
-                WHERE {active_only} GROUP BY 1 ORDER BY n DESC"""
+                WHERE ({active_only}) AND {mine} GROUP BY 1 ORDER BY n DESC""",
+            (user_id,),
         ).fetchall()
-        counts = memory.vocabulary(conn)
+        counts = memory.vocabulary(conn, user_id)
 
     if s["total"] == 0:
-        return "No facts saved yet."
+        return f"No facts saved to {shelf(user_id)} yet."
     pct = f" ({s['never'] / s['active']:.0%})" if s["active"] else ""
     scopes = ", ".join(f"{r['k']} {r['n']}" for r in by_scope) or "—"
     sources = ", ".join(f"{r['k']} {r['n']}" for r in by_source) or "—"
@@ -365,12 +394,38 @@ def memory_stats() -> str:
     hygiene = (f"tags: {len(memory.SEED_TAGS)} standard, {len(added)} added"
                + (f" · {len(singles)} used only once" if singles else ""))
     return (
+        f"{shelf(user_id)}: "
         f"{s['active']} active · {s['expired']} expired · {s['total']} ever\n"
         f"never recalled: {s['never']} of the active facts{pct}\n"
         f"by scope:  {scopes}\n"
         f"by source: {sources}\n"
         f"{hygiene}"
     )
+
+
+# --- who is asking -------------------------------------------------------
+
+@mcp.tool()
+def user_status(ctx: Context) -> str:
+    """Who does this server think you are, and which shelf are you reading and
+    writing? Available in every mode. Call it when a save or a recall landed
+    somewhere you did not expect: it tells you whether the surprise is a bug
+    or just the wrong identity."""
+    user_id, email = current_identity(ctx)
+    if user_id is None:
+        return ("guest - facts go to the shared guest commons, which every "
+                "signed-out caller can read and write. Sign in for a shelf "
+                "only you can see.")
+    return (f"user - signed in as {email or user_id}. Your facts are yours "
+            "alone; no guest can read, retire or overwrite them.")
+
+
+# The OAuth authorization-server endpoints that let a connector sign a user
+# in at all. Kept in its own module for the same reason identity.py is: this
+# file should stay readable as a list of what the instrument can do.
+from auth import register_oauth_routes  # noqa: E402  (after mcp exists)
+
+register_oauth_routes(mcp)
 
 
 if __name__ == "__main__":

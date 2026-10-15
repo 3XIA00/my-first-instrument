@@ -415,8 +415,6 @@ a hidden option cannot be chosen. If the list is too long to show, the answer is
 fewer tags, not less display — and `memory_stats` reports singleton count so
 that failure is visible rather than hoped against.
 
-## OPEN — still to build
+## Still to build
 
-- No-dead-end recall: a keyword miss should return recent facts, not nothing
-- Source label on recall results, so blending with a competing memory is visible
-- `pgvector` for semantic recall — the demonstrated gap
+See `TODO.md` — the queue lives there, the reasoning lives here.
