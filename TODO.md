@@ -10,7 +10,7 @@ in the items below changes direction because of that, but the counts, the tag
 vocabulary and the "what is in here" questions are now all answered per shelf,
 not per table.*
 
-## 0. OAuth — built, not yet confirmed by a human
+## 0. OAuth — done, with one piece deliberately not built
 
 **Done 2026-10-15 (ADR-0007).** `auth.py` makes this server its own
 authorization server: discovery, dynamic client registration, a sign-in page,
@@ -23,19 +23,55 @@ branch — which needs no password — and passes 18 checks, including the three
 that matter: an unregistered `redirect_uri` yields no redirect, a wrong PKCE
 verifier yields no token, and a spent code cannot be spent twice.
 
-**What is left, in order.**
+**Confirmed on the deployed instance, 2026-10-15.** A real client ran the
+entire handshake end to end: Claude Code's connector discovered the metadata,
+opened the sign-in page, took a password, and came back with a token that
+`user_status` resolves to the account that signed in. Facts saved afterwards
+landed on that account's private shelf and `recall` returned them. The
+password branch is no longer an argument; it is an observation.
 
-1. **Click through the sign-in form once.** The password branch has no
-   automated test and cannot have one: signing a real user in needs a real
-   credential. `mint-test-token.py` proves the Better Auth call works, not the
-   form and redirect wrapped around it. Until someone has signed in through a
-   browser and seen `user_status` report their own email, "signed-in users get
-   private shelves" is an argument, not an observation.
-2. **Add it to claude.ai as a custom connector and watch what it does.** The
-   discovery documents are built from `RENDER_EXTERNAL_URL`, so a deployed
-   instance should need no configuration — but "should" is doing real work in
-   that sentence, and no claude.ai client has actually run this handshake yet.
-3. **Move codes and registrations into Postgres.** Only once there is a reason:
+ADR-0007 still says that branch is untested. That was true when it was
+written, and ADRs here are not rewritten (ADR-0001), so this paragraph is the
+update.
+
+**The finding worth keeping.** Claude Code began the OAuth flow *without being
+challenged for it*. This server answers unauthenticated calls with 200 and no
+`WWW-Authenticate` header, so the working assumption was that no client would
+ever attempt authorization — the guest commons would simply swallow everyone.
+It turns out that client probes `/.well-known/oauth-protected-resource` of its
+own accord. A 401 challenge is therefore not what makes sign-in reachable, at
+least not here. That was worth being wrong about out loud: the guest default
+and a discoverable sign-in are less in tension than they looked.
+
+**Decided (2026-10-15): no 401 challenge.** claude.ai was the open question,
+being a different client from Claude Code and under no obligation to share its
+habits. It behaves the same way: the custom connector found the metadata on
+its own, ran the OAuth flow unprompted, and `user_status` there reports the
+same account Claude Code reports. Both surfaces this instrument actually has
+reach the private shelf without ever being challenged for a credential.
+
+So the challenge would buy nothing today, while costing the zero-friction
+local flow — `claude mcp add` against localhost would gain a browser round
+trip before its first call. Roughly thirty lines in `auth.py` plus a branch in
+`__main__`, not written.
+
+**What would bring it back:** a client that waits to be told. The symptom to
+watch for is specific — a connector that attaches fine, reports `guest`, and
+offers no authorization step anywhere in its UI. That is a client expecting a
+`WWW-Authenticate` header it never receives, and it has no way out of the
+commons on its own.
+
+**Worth recording while it is fresh:** the same identity now reaches the same
+private shelf from both Claude Code and claude.ai, and the claude.ai session
+visibly *acted* on the stored preferences rather than merely listing them,
+saying so in its own reply. ADR-0005 argued one database because a file would
+give two memories that never learn from each other; this is the same argument
+one level up, and the first evidence that these facts change behaviour instead
+of just occupying rows.
+
+**What is left.**
+
+1. **Move codes and registrations into Postgres.** Only once there is a reason:
    a second instance, or restarts frequent enough that re-registering annoys
    someone. One table, an afternoon, and a new stored credential to reason
    about. Not before.

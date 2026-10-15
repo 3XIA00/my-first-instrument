@@ -166,10 +166,11 @@ def remember(
 
     ttl = SCOPES[scope]
     when = "never expires" if ttl is None else f"expires in {ttl.days} days"
+    held, never = stats["total"], stats["never"]
     return (
         f"Saved as #{row['id']} to {shelf(user_id)} ({scope}, {when}). "
-        f"That shelf now holds {stats['total']} active facts; "
-        f"{stats['never']} have never been recalled."
+        f"That shelf now holds {held} active fact{'' if held == 1 else 's'}; "
+        f"{never} {'has' if never == 1 else 'have'} never been recalled."
     )
 
 
