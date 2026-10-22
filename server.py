@@ -23,6 +23,24 @@ from memory import SCOPES, db
 
 mcp = FastMCP(
     "your-first-instrument",
+    # Sent with the initialize response and injected into the model's
+    # context before the first user message is processed. It is the only
+    # channel here that arrives BEFORE the agent has decided anything, and
+    # it reaches every MCP client rather than only the ones that read
+    # skills or a CLAUDE.md. It cannot carry the facts themselves -- it is
+    # the same static text for everyone -- so its whole job is to get
+    # briefing() called.
+    instructions=(
+        "This server is the user's own memory: facts they chose to keep "
+        "across conversations, on a shelf private to them.\n\n"
+        "Call briefing() before your first substantive action -- before "
+        "the first edit, command or real answer. It returns their standing "
+        "preferences and any corrections they have issued: the things that "
+        "change HOW you work, which they will not think to repeat and "
+        "which no search will surface in time.\n\n"
+        "Use recall() when a question touches their life, projects or "
+        "history. Use remember() rarely; most sessions should save nothing."
+    ),
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8000)),
 )
@@ -65,6 +83,78 @@ def seconds_since(iso_timestamp: str) -> str:
 # ─── a sense of before ───────────────────────────────────────────────────
 
 @mcp.tool()
+def briefing(ctx: Context) -> str:
+    """The user's standing instructions: how they want you to work.
+
+    Call this BEFORE your first substantive action in a session -- before
+    the first edit, the first command, the first real answer. Not "at the
+    start": you are reading this because you reached for a tool, and that
+    is the moment that matters.
+
+    What it returns is preferences and corrections, which are a different
+    species from the rest of the store. Everything else ANSWERS questions,
+    so recall() finds it when the question arrives. These two CHANGE HOW
+    YOU ACT, and nobody ever asks "what are my preferences?" -- by the time
+    you would think to search for one, you have already done the thing it
+    would have prevented. A correction recalled after the mistake is worth
+    nothing; its entire value is pre-emption.
+
+    Cheap, and safe to call once per session even if it comes back empty.
+    """
+    user_id, _ = current_identity(ctx)
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT id, text, tags, scope FROM facts
+               WHERE (expires_at IS NULL OR expires_at > now())
+                 AND user_id IS NOT DISTINCT FROM %s
+                 AND tags && %s::text[]
+               ORDER BY created_at""",
+            (user_id, list(memory.STANDING_TAGS)),
+        ).fetchall()
+        total = conn.execute(
+            """SELECT count(*) AS n FROM facts
+               WHERE (expires_at IS NULL OR expires_at > now())
+                 AND user_id IS NOT DISTINCT FROM %s""",
+            (user_id,),
+        ).fetchone()["n"]
+        counts = memory.vocabulary(conn, user_id)
+
+    # Deliberately does NOT touch recall_count or push expiry forward, the
+    # way recall() does. This call is automatic: if it counted as a recall,
+    # every preference would look maximally useful by the end of the first
+    # week, and memory_stats would lose the one number that can tell you
+    # whether anything here is earning its place. An automatic read is not
+    # evidence of usefulness. (Cost: a term-scoped correction can expire
+    # while being briefed every session -- promote() it if that happens.)
+    others = total - len(rows)
+    rest = ", ".join(f"{t}({counts[t]})" for t in sorted(counts)
+                     if t not in memory.STANDING_TAGS)
+
+    if not rows:
+        if total == 0:
+            return ("Nothing saved on " + shelf(user_id) + " yet, so there "
+                    "is nothing to apply. remember() is how facts get here.")
+        # Never a bare "none" -- an empty answer every session teaches an
+        # agent to stop calling. Say what IS here, so the call still pays.
+        return (f"No standing preferences or corrections on {shelf(user_id)}.\n"
+                f"It holds {others} other fact{'' if others == 1 else 's'}"
+                + (f" ({rest})" if rest else "")
+                + ", reachable with recall().")
+
+    lines = [f"#{r['id']} [{', '.join(r['tags'])}] {r['text']}"
+             for r in rows]
+    head = (f"{len(rows)} standing instruction"
+            f"{'' if len(rows) == 1 else 's'} from the user "
+            f"({shelf(user_id)}). Apply them from here on:")
+    tail = ""
+    if others:
+        tail = (f"\n\n{others} other fact{'' if others == 1 else 's'} on this "
+                f"shelf" + (f" ({rest})" if rest else "")
+                + ", reachable with recall().")
+    return head + "\n\n" + "\n".join(lines) + tail
+
+
+@mcp.tool()
 def remember(
     fact: str,
     tags: list[str],
@@ -80,6 +170,10 @@ def remember(
     0-2 facts per session. Over-saving is far worse than under-saving: junk
     degrades every future recall, permanently, while a missed fact costs you
     once. When in doubt, don't call this.
+
+    A fact tagged preferences or corrections is delivered by briefing() at
+    the start of a session rather than found by search, so saving one there
+    is how you make it apply next time without anyone remembering to ask.
 
     Two tests before you call:
       1. RE-DERIVATION — if this were lost, could you get it back cheaply?
@@ -182,6 +276,9 @@ def recall(query: str, ctx: Context, tag: str = "", limit: int = 5) -> str:
 
     Returns the best matches AND the shape of everything that matched, so you
     can tell when there is more to see and narrow down instead of guessing.
+
+    For the user's standing preferences and corrections, call briefing()
+    instead: nobody asks for those, so searching never reaches them in time.
 
     Args:
       query: words to search for. Empty string returns the most recent facts.

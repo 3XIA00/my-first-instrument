@@ -36,6 +36,14 @@ SOURCES = ("user_stated", "user_confirmed", "inferred")
 # not, and that asymmetry is what keeps the vocabulary small.
 SEED_TAGS = ("identity", "preferences", "corrections", "decisions",
              "commitments")
+
+# Facts come in two species and only one of them answers questions.
+# identity, decisions and commitments are LOOKED UP: a question arrives and
+# recall() finds them. preferences and corrections are STANDING ORDERS --
+# nobody ever asks "what are my preferences?", so a search can never reach
+# them in time. They have to be delivered unasked, which is what briefing()
+# is for, and this tuple is the line between the two kinds.
+STANDING_TAGS = ("preferences", "corrections")
 MAX_TAGS = 3
 
 MAX_FACT_CHARS = 200
